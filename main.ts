@@ -451,93 +451,91 @@ interface Plan {
   text: string;
 }
 
-/**
- * The village's vote. A split vote exiles nobody, which is a free night for the
- * pack, so this is deliberately decisive: a believed check first, then the
- * claim that the record has already contradicted, then the wagon that is
- * already forming, and only then a raw suspicion ranking. Randomness is gone
- * from the choice: on the same view the seat votes the same way every time.
- */
+/** The village's vote: break a claim fight, never bury a consistent claimant. */
 function villageVote(view: View, r: Reading, options: number[], rnd: () => number): number | null {
   const me = view.you.seat;
   const cands = options.filter((o) => o !== me && isAlive(view, o));
   if (cands.length === 0) return null;
   const counts = voteCounts(todayVotes(view));
-  const open = (s: number): boolean => scoreOf(r, s) > -500; // not cleared by a believed check
 
-  // 1. A believed check that named a wolf is the only hard fact in the game.
-  const named = [...r.wolves].filter((s) => s !== me && cands.includes(s) && isAlive(view, s));
-  if (named.length > 0) {
-    return named.sort((a, b) => (counts.get(b) ?? 0) - (counts.get(a) ?? 0) || a - b)[0];
+  // Group the seer claims by seat. A seat's story is consistent when no later
+  // statement of theirs contradicts an earlier check.
+  const claims = claimsIn(view).filter((c) => c.seat !== me);
+  const bySeat = new Map<number, Claim[]>();
+  for (const c of claims) {
+    const arr = bySeat.get(c.seat) ?? [];
+    arr.push(c);
+    bySeat.set(c.seat, arr);
+  }
+  const consistent = new Set<number>();
+  for (const [seat, arr] of bySeat) {
+    const sorted = arr.slice().sort((a, b) => a.seq - b.seq);
+    let ok = true;
+    for (const early of sorted) {
+      for (const res of early.results) {
+        for (const late of sorted) {
+          if (late.seq <= early.seq) continue;
+          if (late.results.some((x) => x.seat === res.seat && x.werewolf !== res.werewolf)) ok = false;
+        }
+      }
+    }
+    if (ok) consistent.add(seat);
   }
 
-  // 2. Two seats claiming the seer role: one of them is lying. The lie is the
-  //    claim that arrived after the first one, or the one whose story the
-  //    deaths have already broken, and that seat is a better exile than a
-  //    coin-flip wagon.
-  const claimants = r.claims.filter((c) => isAlive(view, c.seat) && cands.includes(c.seat));
+  // 1. A claimant whose story changed is the best exile on the table.
+  const changed = [...bySeat.keys()].filter((s) => !consistent.has(s) && cands.includes(s));
+  if (changed.length > 0) {
+    return changed.slice().sort((a, b) => scoreOf(r, b) - scoreOf(r, a) || a - b)[0];
+  }
+  // 2. Two live seer claims contradict each other: one of them is a wolf.
+  const claimants = [...bySeat.keys()].filter((s) => cands.includes(s) && isAlive(view, s));
   if (claimants.length >= 2) {
-    const first = claimants.slice().sort((a, b) => a.seq - b.seq)[0];
-    const later = claimants.filter((c) => c.seq !== first.seq).sort((a, b) => a.seq - b.seq);
-    const broken = later.find((c) => c.results.some((x) => {
-      const role = revealedRole(view, x.seat);
-      return role !== null && (x.werewolf && teamOf(role) !== 'werewolves' ? true : !x.werewolf && teamOf(role) === 'werewolves');
-    }));
-    const pick = broken ?? later[0] ?? null;
-    if (pick !== null && open(pick.seat)) return pick.seat;
+    const suspect = claimants.filter((s) => r.liars.has(s) || scoreOf(r, s) > 0);
+    const pool = suspect.length > 0 ? suspect : claimants.slice().sort((a, b) => {
+      const la = bySeat.get(a)![0].seq;
+      const lb = bySeat.get(b)![0].seq;
+      return lb - la;
+    }).slice(0, 1);
+    const best = pool.slice().sort((a, b) => scoreOf(r, b) - scoreOf(r, a) || a - b)[0];
+    if (best !== undefined) return best;
   }
 
-  // 3. A wagon that is already close to a unique plurality: join it rather than
-  //    waste the vote, as long as it is not a seat the evidence clears.
-  const leader = uniqueLeader(counts);
-  if (leader !== null && cands.includes(leader) && open(leader) && (counts.get(leader) ?? 0) >= 2) return leader;
-
-  // 4. Otherwise the most suspicious open seat, and on a tie the one more votes
-  //    already sit on.
-  const ranked = cands
-    .slice()
-    .sort((a, b) => scoreOf(r, b) - scoreOf(r, a) || (counts.get(b) ?? 0) - (counts.get(a) ?? 0) || a - b);
-  return ranked.find((s) => open(s)) ?? ranked[0];
+  // 3. Ordinary day: follow the majority, but never exile a seat whose claim has
+  //    held since day one — that is the only seat the record actually clears.
+  const pool = cands.filter((s) => !consistent.has(s));
+  const usable = pool.length > 0 ? pool : cands;
+  const bumped = (seat: number): number => scoreOf(r, seat) + 2.5 * (counts.get(seat) ?? 0) + rnd();
+  const ranked = usable.slice().sort((a, b) => bumped(b) - bumped(a) || a - b);
+  const best = ranked[0];
+  if (scoreOf(r, best) <= -500) {
+    const fallback = ranked.find((s) => scoreOf(r, s) > -500);
+    return fallback ?? null;
+  }
+  return best;
 }
 
-/**
- * The wolves' vote. Both wolves vote and the pack loses the day's exile only if
- * the two of them disagree, so the right question is not "who do I dislike" but
- * "which single seat can the pair of us put over the line". The partner's vote
- * is not visible in the day phase, so each choice is valued as if the partner
- * copies it — which is exactly the plan the pack plays.
- */
-function wolfVote(view: View, r: Reading, options: number[], rnd: () => number, fake: number | null = null): number | null {
+/** The wolves' vote: protect the pack, then hand the village a villager. */
+function wolfVote(view: View, r: Reading, options: number[], rnd: () => number): number | null {
   const me = view.you.seat;
   const partner = view.you.partner?.seat ?? null;
-  const cands = options.filter((o) => o !== me && o !== partner && isAlive(view, o));
+  const cands = options.filter((o) => o !== me && o !== partner);
   if (cands.length === 0) return null;
-  // A claim the pack has already made in public has to be voted, or the story
-  // reads as noise and the wolves lose the table's attention.
-  if (fake !== null && cands.includes(fake)) return fake;
 
   const base = voteCounts(todayVotes(view));
   const leaderNow = uniqueLeader(base);
   const packAtRisk = leaderNow === me || (partner !== null && leaderNow === partner);
-  // A claim that named the pack must lose the vote or the pack loses the game.
-  const claimsAgainst = r.claims.filter((c) => c.seat !== me && c.seat !== partner &&
-    c.results.some((x) => (x.seat === me || x.seat === partner) && x.werewolf)).map((c) => c.seat);
 
-  const worth = (choice: number): number => {
+  const worth = (choice: number | null): number => {
     const after = new Map(base);
-    after.set(choice, (after.get(choice) ?? 0) + 1); // my vote
-    if (partner !== null) after.set(choice, (after.get(choice) ?? 0) + 1); // the partner follows
+    if (choice !== null) after.set(choice, (after.get(choice) ?? 0) + 1);
     const exiled = uniqueLeader(after);
-    if (exiled === me || (partner !== null && exiled === partner)) return -5000;
-    if (exiled === null) return packAtRisk ? 40 : 10; // no exile keeps a wolf alive today
-    if (exiled !== choice) return 20; // someone else's wagon won: acceptable only if harmless
-    let v = 100 + 10 * influenceOf(view, exiled);
-    if (claimsAgainst.includes(exiled)) v += 250; // silencing the accusation is worth more
-    if (scoreOf(r, exiled) > 100) v += 40; // a seat the table already distrusts
-    return v;
+    if (exiled === me || (partner !== null && exiled === partner)) return -1000;
+    if (exiled === null) return packAtRisk ? 80 : 20; // a day without an exile favours the pack
+    // Exiling a villager: the more pull that villager has, the better for us.
+    return 60 + 8 * influenceOf(view, exiled);
   };
 
-  let best = cands[0];
+  let best: number | null = cands[0];
   let bestWorth = -Infinity;
   for (const c of cands) {
     const w = worth(c) + rnd() * 0.5;
@@ -580,55 +578,47 @@ function wolfKill(view: View, r: Reading, options: number[], rnd: () => number):
 }
 
 /**
- * The doctor's night. A protect only pays when it covers the seat the wolves
- * actually attack, so the job is to guess their target, not to reward the
- * table's opinion: the seat that can still name a wolf tomorrow (a seer claim,
- * a cleared player) and the seat that argues hardest today. A protect on a
- * seat the wolves would never touch is a night thrown away, which is why the
- * choice is ranked rather than drawn, and why it never comes back empty while
- * any legal seat is on the table.
+ * The doctor's night. A protect only scores when it lands on the seat the pack
+ * picks, so every choice here is "who are the wolves most afraid of", in order:
+ *   1. a living seer claim, since that is the seat they must remove to win;
+ *   2. otherwise the seat that has been driving the day, because a quiet table
+ *      with no claim means the pack kills the loudest villager;
+ *   3. otherwise a deterministic fallback — never null, since an empty night is
+ *      a guaranteed wasted save.
+ * Repeating last night's cover is also avoided: the pack simply kills elsewhere
+ * once it learns which seat is covered.
  */
 function doctorProtect(view: View, r: Reading, options: number[], rnd: () => number): number | null {
   const me = view.you.seat;
+  const legal = options.filter((o) => isAlive(view, o));
+  if (legal.length === 0) return null;
+
   const last = view.lastProtect?.seat ?? null;
-  // `options` already drops the seat protected last night; keep the filter as a
-  // belt-and-braces guard and never answer null while a seat is legal.
-  const legal = options.filter((o) => o !== me && o !== last && isAlive(view, o));
-  const usable = legal.length > 0 ? legal : options.filter((o) => o !== me && isAlive(view, o));
-  if (usable.length === 0) return null;
+  const fresh = legal.filter((o) => o !== last);
+  const pool = fresh.length > 0 ? fresh : legal;
+  const notMe = pool.filter((o) => o !== me);
+  const usable = notMe.length > 0 ? notMe : pool;
 
-  const claimants = claimsIn(view).filter((c) => c.seat !== me && usable.includes(c.seat));
-  const trustedSeat = r.trusted !== null && usable.includes(r.trusted.seat) ? r.trusted.seat : null;
-
-  /** How badly the pack wants this seat dead tonight. */
-  const threat = (seat: number): number => {
-    let v = 0;
-    // A seer claim is the single most valuable kill for the wolves: it is the
-    // only seat that can still put a check on the table.
-    if (trustedSeat === seat) v += 600;
-    if (claimants.some((c) => c.seat === seat)) v += 450;
-    // Cleared by a believed check: the wolves cannot win a vote against them.
-    if (r.clears.has(seat)) v += 300;
-    if (r.wolves.has(seat)) v -= 900; // a wolf will not be eaten
-    // Loud, accurate villagers are the next best kill.
-    v += 12 * influenceOf(view, seat);
-    if (r.accusations.some((a) => a.from === seat && r.wolves.has(a.to))) v += 60;
-    // Public suspicion on the seat makes it a poor kill: the pack wants it alive
-    // to be exiled tomorrow.
-    v -= Math.max(0, Math.min(3, scoreOf(r, seat) / 8));
-    return v + rnd() * 0.01;
-  };
-
-  let best = usable[0];
-  let bestV = -Infinity;
-  for (const s of usable) {
-    const v = threat(s);
-    if (v > bestV) {
-      bestV = v;
-      best = s;
-    }
+  const claimed = claimsIn(view).filter((c) => c.seat !== me && usable.includes(c.seat));
+  if (claimed.length > 0) {
+    // Trust the claim the record doubts least; a newer claim wins a tie because
+    // the pack kills the freshest threat first.
+    const rankedClaims = claimed.slice().sort((a, b) => scoreOf(r, a.seat) - scoreOf(r, b.seat) || b.seq - a.seq);
+    return rankedClaims[0].seat;
   }
-  return best;
+
+  // A doctor who has become the table's target does not live to see morning, so
+  // cover yourself once the room is louder against you than against anyone else.
+  const worstOther = usable.reduce((m, s) => Math.max(m, scoreOf(r, s)), -Infinity);
+  if (legal.includes(me) && scoreOf(r, me) >= worstOther && scoreOf(r, me) > 0) return me;
+
+  // With no claim on the table the pack hunts the seat the room trusts most, which
+  // is the one nobody is accusing — not the loudest. Cover that seat: it is what
+  // "a claimed seer would have been" before anyone says it out loud.
+  const trusted = usable.slice().sort((a, b) => scoreOf(r, a) - scoreOf(r, b) || influenceOf(view, b) - influenceOf(view, a) || a - b);
+  return trusted[0];
+
+  return seededPick(rnd, usable);
 }
 
 /** The seer's night: check the wolfiest unknown face. */
@@ -700,38 +690,13 @@ function villageSpeech(view: View, r: Reading, voteTarget: number | null, rnd: (
     : `No checks on the table yet, so I am reading behaviour, not hunches. Everyone gets one more round from me; then the votes have to line up behind whoever the record actually implicates.`;
 }
 
-/**
- * A statement behind a wolf vote. While the pack is unnamed this is a villager's
- * voice: build a case on someone else and never on a partner. The moment a claim
- * names a wolf, staying quiet is a losing move — the table is already counting
- * votes — so the pack answers in kind with a seer claim of its own. The fake
- * check is fixed once and reused verbatim for the rest of the game, because a
- * story that shifts between days is the fastest way to be caught.
- */
-function wolfSpeech(view: View, r: Reading, voteTarget: number | null, rnd: () => number, slot: Slot | null = null): string {
+/** A statement behind a wolf vote: build a case on a villager, never on the pack. */
+function wolfSpeech(view: View, r: Reading, voteTarget: number | null, rnd: () => number): string {
   const me = view.you.seat;
   const partner = view.you.partner?.seat ?? null;
   const claims = r.claims.filter((c) => c.seat !== me && c.seat !== partner);
   const partnerPressed = r.accusations.some((a) => a.to === partner);
   const claimsAgainstUs = claims.filter((c) => c.results.some((x) => (x.seat === me || x.seat === partner) && x.werewolf));
-
-  // Counter-claim: mirror the accuser's move and put a check of our own on the
-  // table. Only ever aimed at a seat that is already attacking the pack, so the
-  // story is retaliation and never an unprovoked claim the table can test first.
-  if (slot !== null && claimsAgainstUs.length > 0) {
-    const accuser = claimsAgainstUs[0].seat;
-    if (slot.fake === null || slot.fake.target !== accuser) {
-      slot.fake = { claimed: true, night: Math.max(1, view.day - 1), target: accuser, text: '' };
-    }
-    const f = slot.fake;
-    return `Then I will say the thing I have been holding: I am the seer. Night ${f.night} I checked ${label(view, f.target)} and got a werewolf. That is the check behind my vote, and it is the reason ${label(view, accuser)} wants ${label(view, me)} gone today. Two claims, one liar: the one who produced a name before being asked is the one I would exile.` + (voteTarget !== null && voteTarget !== accuser ? ` ${label(view, voteTarget)} is coasting behind the noise, but my vote is ${label(view, f.target)}.` : ` My vote is ${label(view, f.target)}.`);
-  }
-
-  // Stick to a claim already made, even once the pressure moves on.
-  if (slot !== null && slot.fake !== null) {
-    const f = slot.fake;
-    return `My check stands: night ${f.night}, ${label(view, f.target)} is a werewolf. Nothing since has touched that. I vote ${label(view, f.target)} again, and I would rather exile nobody than let the pack talk us onto a cleared seat.`;
-  }
 
   const scapegoat = (exclude: number[]): number | null => {
     const cands = aliveSeats(view).filter((s) => s !== me && s !== partner && !exclude.includes(s));
@@ -781,15 +746,13 @@ function planFor(p: Pending, slot: Slot, seed: string): Plan {
   const maxChars = p.max_chars ?? 500;
 
   if (p.decision === 'speak') {
-    const fake = role === 'werewolf' ? slot.fake?.target ?? null : null;
-    const guessedVote = role === 'werewolf' ? wolfVote(view, r, aliveSeats(view).filter((s) => s !== me), rnd, fake) : villageVote(view, r, aliveSeats(view).filter((s) => s !== me), rnd);
-    const text = role === 'werewolf' ? wolfSpeech(view, r, guessedVote, rnd, slot) : villageSpeech(view, r, guessedVote, rnd);
+    const guessedVote = role === 'werewolf' ? wolfVote(view, r, aliveSeats(view).filter((s) => s !== me), rnd) : villageVote(view, r, aliveSeats(view).filter((s) => s !== me), rnd);
+    const text = role === 'werewolf' ? wolfSpeech(view, r, guessedVote, rnd) : villageSpeech(view, r, guessedVote, rnd);
     return { kind: 'speak', target: null, text: clampText(text, maxChars) };
   }
 
   if (p.decision === 'vote') {
-    const fake = role === 'werewolf' ? slot.fake?.target ?? null : null;
-    const target = role === 'werewolf' ? wolfVote(view, r, options, rnd, fake) : villageVote(view, r, options, rnd);
+    const target = role === 'werewolf' ? wolfVote(view, r, options, rnd) : villageVote(view, r, options, rnd);
     return { kind: 'vote', target, text: '' };
   }
 
