@@ -601,14 +601,13 @@ function doctorProtect(view: View, r: Reading, options: number[], rnd: () => num
 
   const claimed = claimsIn(view).filter((c) => c.seat !== me && usable.includes(c.seat));
   if (claimed.length > 0) {
-    // Trust the claim the record doubts least; a newer claim wins a tie because
-    // the pack kills the freshest threat first.
-    const rankedClaims = claimed.slice().sort((a, b) => scoreOf(r, a.seat) - scoreOf(r, b.seat) || b.seq - a.seq);
-    return rankedClaims[0].seat;
+    // Klaim yang diduga paling rendah, derajat terbaru menang tie.
+    claimed.sort((a, b) => scoreOf(r, a.seat) - scoreOf(r, b.seat) || b.seq - a.seq);
+    return claimed[0].seat;
   }
 
-  // A doctor who has become the table's target does not live to see morning, so
-  // cover yourself once the room is louder against you than against anyone else.
+  // Dokter yang menjadi target meka tidak sampai pagi, tutup diri sendiri saat
+  // meka lebih keras melawanmu dari pada siapa pun lain.
   const worstOther = usable.reduce((m, s) => Math.max(m, scoreOf(r, s)), -Infinity);
   if (legal.includes(me) && scoreOf(r, me) >= worstOther && scoreOf(r, me) > 0) return me;
 
@@ -657,6 +656,9 @@ function villageSpeech(view: View, r: Reading, voteTarget: number | null, rnd: (
       const sug = voteTarget !== null ? ` My best exile is ${label(view, voteTarget)}: no claim, no pressure, and a vote history that never cost them anything.` : '';
       return `I am the seer. ${checks}.${sug} Doctor, cover me tonight and the next check settles this.`;
     }
+    if (day === 1) {
+      return `I am the seer. First check goes in tonight; I will name the werewolf tomorrow with the result, and until then I am watching how votes move.`;
+    }
   }
 
   if (wolfy.length > 0) {
@@ -680,14 +682,11 @@ function villageSpeech(view: View, r: Reading, voteTarget: number | null, rnd: (
     return `Day ${day}, and ${label(view, voteTarget)} is where the evidence points: ${n > 0 ? `${n} vote${n === 1 ? '' : 's'} already` : 'no pressure yet, which suits them'}, no check to clear them, and nothing in the record they would have to explain.${tail} I am voting ${label(view, voteTarget)}.`;
   }
 
-  const quiet = aliveSeats(view)
-    .filter((s) => s !== me && influenceOf(view, s) < 1)
-    .slice()
-    .sort((a, b) => a - b);
-  const pickSeat = quiet[0] ?? null;
-  return pickSeat !== null
-    ? `Nothing is settled yet. ${label(view, pickSeat)} has said little that costs them anything, and silence is how a wolf survives day one. I would start there, but I will move the moment someone produces a check.`
-    : `No checks on the table yet, so I am reading behaviour, not hunches. Everyone gets one more round from me; then the votes have to line up behind whoever the record actually implicates.`;
+  if (r.trusted !== null && isAlive(view, r.trusted.seat)) {
+    return `I am backing the seer claim from ${label(view, r.trusted.seat)}: it is the only check we have, and a split vote hands the wolves another night kill. I am not voting anywhere else today.`;
+  }
+
+  return `No checks on the table yet, so I am reading behaviour, not hunches. Everyone gets one more round from me; then the votes have to line up behind whoever the record actually implicates.`;
 }
 
 /** A statement behind a wolf vote: build a case on a villager, never on the pack. */
